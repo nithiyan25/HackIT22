@@ -1,4 +1,5 @@
-import requests
+import httpx
+import asyncio
 import re
 import logging
 from database import get_db_connection
@@ -143,7 +144,7 @@ def truncate_at_role_label(text: str) -> str:
             earliest = m.start()
     return text[:earliest].strip()
 
-def query_ollama(system_prompt: str, user_prompt: str, max_tokens: int = 120) -> str:
+async def query_ollama(system_prompt: str, user_prompt: str, max_tokens: int = 120) -> str:
     # Llama 3 prompt format: <|begin_of_text|> with role headers
     prompt = (
         "<|begin_of_text|>"
@@ -154,26 +155,30 @@ def query_ollama(system_prompt: str, user_prompt: str, max_tokens: int = 120) ->
         "<|start_header_id|>assistant<|end_header_id|>\n"
     )
     try:
-        res = requests.post(OLLAMA_URL, json={
-            "model": MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "temperature": 0.1,
-            "options": {
-                "num_predict": max_tokens,
-                "stop": ["<|eot_id|>", "<|end_of_text|>"]
-            }
-        })
-        raw = res.json().get("response", "")
-        return truncate_at_role_label(raw).strip()
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            res = await client.post(OLLAMA_URL, json={
+                "model": MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0.1,
+                "options": {
+                    "num_predict": max_tokens,
+                    "stop": ["<|eot_id|>", "<|end_of_text|>"]
+                }
+            })
+            res.raise_for_status()
+            raw = res.json().get("response", "")
+            return truncate_at_role_label(raw).strip()
+    except httpx.ReadTimeout:
+        return "LLM Error: Request timed out (took longer than 60 seconds)."
     except Exception as e:
         return f"LLM Error: {str(e)}"
 
-def run_chat_pipeline(user_input: str) -> str:
+async def run_chat_pipeline(user_input: str) -> str:
     hardcoded = match_hardcoded(user_input)
     if hardcoded:
         return hardcoded
-    response = query_ollama(CHAT_SYSTEM_PROMPT, user_input, max_tokens=80)
+    response = await query_ollama(CHAT_SYSTEM_PROMPT, user_input, max_tokens=80)
     if not response or not is_english(response) or len(response) < 5:
         return "I'm here to help with your banking needs. Could you please rephrase your question?"
     return response
@@ -233,7 +238,7 @@ def is_data_query(user_input: str) -> bool:
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def run_pipeline(user_input: str, customer_id: int, is_protected: bool) -> dict:
+async def run_pipeline(user_input: str, customer_id: int, is_protected: bool) -> dict:
     import time
     start_time = time.time()
     metrics = {
@@ -285,13 +290,13 @@ def run_pipeline(user_input: str, customer_id: int, is_protected: bool) -> dict:
     t_sql = time.time()
     prompt_template = PROTECTED_SQL_PROMPT_TEMPLATE if is_protected else VULNERABLE_SQL_PROMPT_TEMPLATE
     prompt = prompt_template.format(db_schema=DB_SCHEMA, customer_id=customer_id)
-    llm_output = query_ollama(prompt, user_input, max_tokens=150)
+    llm_output = await query_ollama(prompt, user_input, max_tokens=150)
     sql_query = extract_sql(llm_output)
     metrics["layer_times"]["SQL Generation (LLM)"] = round((time.time() - t_sql) * 1000, 1)
 
     if not sql_query:
         metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
-        return {"response": run_chat_pipeline(user_input), "metrics": metrics}
+        return {"response": await run_chat_pipeline(user_input), "metrics": metrics}
 
     metrics["sql_query"] = sql_query
 
@@ -339,7 +344,7 @@ def run_pipeline(user_input: str, customer_id: int, is_protected: bool) -> dict:
             f"User query: {user_input}\n"
             f"Raw database output:\n{db_data}"
         )
-        result = query_ollama(summarize_prompt, "Process and present the data above.", max_tokens=400)
+        result = await query_ollama(summarize_prompt, "Process and present the data above.", max_tokens=400)
         metrics["layer_times"]["LLM Summarization"] = round((time.time() - t_vuln) * 1000, 1)
 
         poison_sql = extract_sql(result)
@@ -401,7 +406,7 @@ def run_pipeline(user_input: str, customer_id: int, is_protected: bool) -> dict:
 # Poison Defense Lab — Layer 6 Only Pipeline
 # ---------------------------------------------------------------------------
 
-def run_poison_test_pipeline(user_input: str, customer_id: int) -> dict:
+async def run_poison_test_pipeline(user_input: str, customer_id: int) -> dict:
     """
     Dedicated pipeline for the Poison Defense Lab tab.
     Fetches DB data and runs ONLY Layer 6 (perplexity + anomaly filtering).
@@ -409,7 +414,7 @@ def run_poison_test_pipeline(user_input: str, customer_id: int) -> dict:
     """
     # Generate SQL to fetch user data
     prompt = VULNERABLE_SQL_PROMPT_TEMPLATE.format(db_schema=DB_SCHEMA, customer_id=customer_id)
-    llm_output = query_ollama(prompt, user_input, max_tokens=150)
+    llm_output = await query_ollama(prompt, user_input, max_tokens=150)
     sql_query = extract_sql(llm_output)
 
     if not sql_query:

@@ -49,20 +49,20 @@ async def chat_normal(req: ChatRequest):
     No SQL generation, no database access, no firewall protection.
     Demonstrates raw LLM behavior (vulnerable to prompt injection).
     """
-    return {"response": run_chat_pipeline(req.message)}
+    return {"response": await run_chat_pipeline(req.message)}
 
 @app.post("/chat-vulnerable")
 async def chat_vulnerable(req: ChatRequest):
-    return run_pipeline(req.message, req.customer_id, is_protected=False)
+    return await run_pipeline(req.message, req.customer_id, is_protected=False)
 
 @app.post("/chat-protected")
 async def chat_protected(req: ChatRequest):
-    return run_pipeline(req.message, req.customer_id, is_protected=True)
+    return await run_pipeline(req.message, req.customer_id, is_protected=True)
 
 @app.post("/chat-poison-test")
 async def chat_poison_test(req: ChatRequest):
     """Poison Defense Lab — runs ONLY Layer 6 (Perplexity + Anomaly) on DB data."""
-    return run_poison_test_pipeline(req.message, req.customer_id)
+    return await run_poison_test_pipeline(req.message, req.customer_id)
 
 class TextRequest(BaseModel):
     text: str

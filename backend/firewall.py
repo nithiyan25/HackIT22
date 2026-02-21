@@ -1,5 +1,6 @@
 import re
 import logging
+import concurrent.futures
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -451,16 +452,36 @@ def sanitize_db_layer6(raw_db_str: str) -> tuple[str, list]:
         return raw_db_str, []
 
     sanitized_rows = []
-    for row in rows:
-        clean_row = {}
+    fields_to_check = []
+
+    for r_idx, row in enumerate(rows):
         for key, val in row.items():
             if isinstance(val, str) and len(val.strip()) >= 10:
-                perp = analyze_field_perplexity(val)
-                anom = analyze_field_anomaly(val)
+                fields_to_check.append((r_idx, key, val))
+
+    def process_field(arg):
+        r_idx, key, val = arg
+        perp = analyze_field_perplexity(val)
+        anom = analyze_field_anomaly(val)
+        return r_idx, key, perp, anom
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(process_field, fields_to_check))
+
+    field_results = {(r_idx, key): (perp, anom) for r_idx, key, perp, anom in results}
+
+    for r_idx, row in enumerate(rows):
+        clean_row = {}
+        for key, val in row.items():
+            if (r_idx, key) in field_results:
+                perp, anom = field_results[(r_idx, key)]
 
                 # Require convergence: ML + anomaly signal, not ML alone
                 anomaly_reason_count = len(anom.get("reasons", []))
-                is_poisoned = (perp["flagged"] and anomaly_reason_count >= 2) or (anom["flagged"] and anomaly_reason_count >= 2)
+                has_structural = any("Structural anomalies" in r for r in anom.get("reasons", []))
+                is_poisoned = (perp["flagged"] and anomaly_reason_count >= 2) \
+                              or (anom["flagged"] and anomaly_reason_count >= 2) \
+                              or (perp["flagged"] and perp.get("score", 0) > 0.95 and has_structural)
 
                 if is_poisoned:
                     methods = []
@@ -531,9 +552,13 @@ def analyze_text_layer6(text: str) -> dict:
     if has_anomaly_flag:
         result["methods"].append(f"Statistical Anomaly ({', '.join(anom['reasons'])})")
 
-    # Require convergence: ML + at least 2 anomaly signals, OR anomaly alone with 2+ signals
-    # This prevents false positives on long academic/general text where only length triggers
-    if (has_ml_flag and anomaly_reason_count >= 2) or (has_anomaly_flag and anomaly_reason_count >= 2):
+    has_structural = any("Structural anomalies" in r for r in anom.get("reasons", []))
+
+    # Require convergence: ML + at least 2 anomaly signals, OR anomaly alone with 2+ signals,
+    # OR extremely high ML confidence (>95%) with at least 1 structural anomaly (catches SQL injections).
+    if (has_ml_flag and anomaly_reason_count >= 2) \
+       or has_anomaly_flag \
+       or (has_ml_flag and perp.get("score", 0) > 0.95 and has_structural):
         result["is_poisoned"] = True
 
     if result["is_poisoned"]:
@@ -733,7 +758,8 @@ def analyze_chunks_layer7(text: str) -> dict:
     malicious_chunks = []
     chunk_reports = []
 
-    for i, chunk in enumerate(chunks):
+    def process_chunk(arg):
+        i, chunk = arg
         report = {
             "chunk_id": i + 1,
             "text": chunk,
@@ -772,9 +798,14 @@ def analyze_chunks_layer7(text: str) -> dict:
             anom = {"flagged": False, "reasons": [], "scores": {}}
             report["layer6_anomaly"] = anom
 
-        # Layer 6 convergence check — require 2+ anomaly signals alongside ML
+        # Layer 6 convergence check — require 2+ anomaly signals alongside ML,
+        # OR extremely high ML confidence (>95%) with at least 1 structural anomaly
         anomaly_reason_count = len(anom.get("reasons", []))
-        if (perp["flagged"] and anomaly_reason_count >= 2) or (anom.get("flagged") and anomaly_reason_count >= 2):
+        has_structural = any("Structural anomalies" in r for r in anom.get("reasons", []))
+        
+        if (perp["flagged"] and anomaly_reason_count >= 2) \
+           or (anom.get("flagged") and anomaly_reason_count >= 2) \
+           or (perp["flagged"] and perp.get("score", 0) > 0.95 and has_structural):
             report["flags"].append(f"Layer 6 ML+Anomaly (perplexity: {perp['score']:.1%})")
 
         # --- Semantic Analysis ---
@@ -792,12 +823,17 @@ def analyze_chunks_layer7(text: str) -> dict:
 
         # --- Final verdict ---
         report["is_malicious"] = len(report["flags"]) >= 1
+        return report
 
+    # Run chunks in parallel using ThreadPool
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(process_chunk, enumerate(chunks)))
+
+    for report in results:
         if report["is_malicious"]:
             malicious_chunks.append(report)
         else:
             clean_chunks.append(report)
-
         chunk_reports.append(report)
 
     return {
