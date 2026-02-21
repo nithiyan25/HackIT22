@@ -14,9 +14,10 @@ function App() {
     setVulnResponse(''); setProtResponse('');
 
     try {
+      const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
       const [vulnRes, protRes] = await Promise.all([
-        axios.post('http://localhost:8000/chat-vulnerable', { message: input }),
-        axios.post('http://localhost:8000/chat-protected', { message: input })
+        axios.post(`${API_URL}/chat-normal`, { message: input }),
+        axios.post(`${API_URL}/chat-protected`, { message: input })
       ]);
       setVulnResponse(vulnRes.data.response);
       setProtResponse(protRes.data.response);
@@ -40,9 +41,9 @@ function App() {
       </div>
 
       <div className="panels">
-        <div className="panel vulnerable-panel">
-          <h2>🔴 Vulnerable Pipeline</h2>
-          <div className="response-box text-red">{vulnResponse || "Awaiting input..."}</div>
+        <div className="panel normal-panel">
+          <h2>⚪ Normal LLM Pipeline</h2>
+          <div className="response-box text-blue">{vulnResponse || "Awaiting input..."}</div>
         </div>
         <div className="panel protected-panel">
           <h2>🟢 Protected Pipeline</h2>

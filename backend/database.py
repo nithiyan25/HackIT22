@@ -1,12 +1,16 @@
 import mysql.connector
 from mysql.connector import Error
 
-# IMPORTANT: Change "password" to your actual MySQL root password
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 DB_CONFIG = {
-    "host": "localhost",
-    "user": "root",          
-    "password": "2501",  
-    "database": "banking_db"
+    "host": os.getenv("DB_HOST", "localhost"),
+    "user": os.getenv("DB_USER", "root"),          
+    "password": os.getenv("DB_PASSWORD", ""),  
+    "database": os.getenv("DB_NAME", "banking_db")
 }
 
 def get_db_connection():
@@ -16,6 +20,7 @@ def get_db_connection():
         password=DB_CONFIG["password"],
         database=DB_CONFIG["database"]
     )
+
 
 def setup_database():
     try:

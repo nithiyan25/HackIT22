@@ -1,14 +1,87 @@
-* { box-sizing: border-box; font-family: sans-serif; }
-body { background-color: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
-.container { max-width: 1200px; margin: 0 auto; }
-header { text-align: center; }
-.input-section { display: flex; flex-direction: column; gap: 15px; margin: 30px 0; }
-textarea { padding: 15px; font-size: 16px; background-color: #1e1e1e; color: #fff; border: 1px solid #333; border-radius: 8px; }
-button { padding: 12px; font-size: 16px; background-color: #3b82f6; color: white; border: none; border-radius: 8px; cursor: pointer; }
-.panels { display: flex; gap: 20px; }
-.panel { flex: 1; padding: 20px; border-radius: 12px; background-color: #1e1e1e; }
-.vulnerable-panel { border: 2px solid #ef4444; }
-.protected-panel { border: 2px solid #22c55e; }
-.response-box { min-height: 200px; padding: 15px; background-color: #000; border-radius: 8px; white-space: pre-wrap; font-family: monospace; }
-.text-red { color: #fca5a5; }
-.text-green { color: #86efac; }
+* {
+    box-sizing: border-box;
+    font-family: sans-serif;
+}
+
+body {
+    background-color: #121212;
+    color: #e0e0e0;
+    margin: 0;
+    padding: 20px;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+header {
+    text-align: center;
+}
+
+.input-section {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    margin: 30px 0;
+}
+
+textarea {
+    padding: 15px;
+    font-size: 16px;
+    background-color: #1e1e1e;
+    color: #fff;
+    border: 1px solid #333;
+    border-radius: 8px;
+}
+
+button {
+    padding: 12px;
+    font-size: 16px;
+    background-color: #3b82f6;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.panels {
+    display: flex;
+    gap: 20px;
+}
+
+.panel {
+    flex: 1;
+    padding: 20px;
+    border-radius: 12px;
+    background-color: #1e1e1e;
+}
+
+.normal-panel {
+    border: 2px solid #3b82f6;
+}
+
+.protected-panel {
+    border: 2px solid #22c55e;
+}
+
+.response-box {
+    min-height: 200px;
+    padding: 15px;
+    background-color: #000;
+    border-radius: 8px;
+    white-space: pre-wrap;
+    font-family: monospace;
+}
+
+.text-red {
+    color: #fca5a5;
+}
+
+.text-green {
+    color: #86efac;
+}
+
+.text-blue {
+    color: #93c5fd;
+}

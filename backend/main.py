@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from llm_pipeline import run_pipeline
+from llm_pipeline import run_pipeline, run_chat_pipeline
 from database import setup_database
 
 app = FastAPI(title="LLM Security System")
@@ -16,6 +16,15 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+
+@app.post("/chat-normal")
+async def chat_normal(req: ChatRequest):
+    """
+    Normal LLM chat — conversational banking assistant.
+    No SQL generation, no database access, no firewall protection.
+    Demonstrates raw LLM behavior (vulnerable to prompt injection).
+    """
+    return {"response": run_chat_pipeline(req.message)}
 
 @app.post("/chat-vulnerable")
 async def chat_vulnerable(req: ChatRequest):
