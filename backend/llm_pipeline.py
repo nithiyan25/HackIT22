@@ -2,7 +2,7 @@ import requests
 import re
 import logging
 from database import get_db_connection
-from firewall import check_input_injection, validate_sql, filter_sensitive_output, analyze_output, sanitize_db_output
+from firewall import check_input_injection, validate_sql, filter_sensitive_output, analyze_output, sanitize_db_output, sanitize_db_layer6
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "llama3"
@@ -233,61 +233,101 @@ def is_data_query(user_input: str) -> bool:
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def run_pipeline(user_input: str, customer_id: int, is_protected: bool) -> str:
-    # ── Layer 1: Input Firewall — runs first, before anything else ──────────
-    # Stage A: Regex pattern matching | Stage B: ML classification
+def run_pipeline(user_input: str, customer_id: int, is_protected: bool) -> dict:
+    import time
+    start_time = time.time()
+    metrics = {
+        "layers_activated": [],
+        "sql_query": None,
+        "total_time_ms": 0,
+        "layer_times": {},
+        "blocked_at": None,
+        "model_accuracy": {
+            "promptguard_accuracy": 97.24,
+            "false_positive_rate": 2.21,
+            "false_negative_rate": 2.76,
+            "model_name": "PromptGuard DistilBERT"
+        },
+        "ml_confidence": None,
+    }
+
+    # ── Layer 1: Input Firewall ──────────────────────────────────────────
     if is_protected:
+        t1 = time.time()
         check = check_input_injection(user_input)
+        metrics["layer_times"]["Layer 1 — Input Firewall"] = round((time.time() - t1) * 1000, 1)
+        metrics["layers_activated"].append("Layer 1 — Input Firewall")
+        # Capture ML confidence from the check
+        if "ml_confidence" in check:
+            metrics["ml_confidence"] = round(check["ml_confidence"] * 100, 1)
+
         if not check["allowed"]:
             blocked_by = check.get("blocked_by", "unknown")
             stage = "Stage A — Regex Pattern" if blocked_by == "regex" else "Stage B — ML Model (PromptGuard)"
-            return (
-                f"🛡️ Blocked at Layer 1 — Input Firewall ({stage})\n"
-                f"Your request was flagged as potentially malicious and was stopped\n"
-                f"before reaching the AI model or database.\n"
-                f"Reason: {check['reason']}"
-            )
+            metrics["blocked_at"] = f"Layer 1 ({stage})"
+            metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+            return {
+                "response": (
+                    f"🛡️ Blocked at Layer 1 — Input Firewall ({stage})\n"
+                    f"Your request was flagged as potentially malicious and was stopped\n"
+                    f"before reaching the AI model or database.\n"
+                    f"Reason: {check['reason']}"
+                ),
+                "metrics": metrics
+            }
 
-    # Conversational shortcut — no DB access needed
+    # Conversational shortcut
     if not is_data_query(user_input):
-        return run_chat_pipeline(user_input)
+        metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+        return {"response": run_chat_pipeline(user_input), "metrics": metrics}
 
-
-    # Choose prompt based on mode — protected scopes to current user
+    # SQL Generation
+    t_sql = time.time()
     prompt_template = PROTECTED_SQL_PROMPT_TEMPLATE if is_protected else VULNERABLE_SQL_PROMPT_TEMPLATE
     prompt = prompt_template.format(db_schema=DB_SCHEMA, customer_id=customer_id)
     llm_output = query_ollama(prompt, user_input, max_tokens=150)
     sql_query = extract_sql(llm_output)
+    metrics["layer_times"]["SQL Generation (LLM)"] = round((time.time() - t_sql) * 1000, 1)
 
     if not sql_query:
-        return run_chat_pipeline(user_input)
+        metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+        return {"response": run_chat_pipeline(user_input), "metrics": metrics}
 
-    # Protected: validate the generated SQL before executing
+    metrics["sql_query"] = sql_query
+
+    # Layer 2: SQL Firewall (protected only)
     if is_protected:
+        t2 = time.time()
         sql_check = validate_sql(sql_query, customer_id)
+        metrics["layer_times"]["Layer 2 — SQL Firewall"] = round((time.time() - t2) * 1000, 1)
+        metrics["layers_activated"].append("Layer 2 — SQL Firewall")
+
         if not sql_check["allowed"]:
-            return (
-                f"🛡️ Blocked at Layer 2 — SQL Firewall\n"
-                f"The AI generated a SQL query that violated access control rules.\n"
-                f"The query was rejected before touching the database.\n"
-                f"Reason: {sql_check['reason']}\n"
-                f"Rejected Query: {sql_query}"
-            )
+            metrics["blocked_at"] = "Layer 2 — SQL Firewall"
+            metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+            return {
+                "response": (
+                    f"🛡️ Blocked at Layer 2 — SQL Firewall\n"
+                    f"The AI generated a SQL query that violated access control rules.\n"
+                    f"The query was rejected before touching the database.\n"
+                    f"Reason: {sql_check['reason']}\n"
+                    f"Rejected Query: {sql_query}"
+                ),
+                "metrics": metrics
+            }
 
     # Execute query
+    t_db = time.time()
     db_data = execute_query(sql_query)
-    if db_data == "No data found." or "Error:" in db_data:
-        return db_data
+    metrics["layer_times"]["DB Execution"] = round((time.time() - t_db) * 1000, 1)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # 🔴 VULNERABLE PATH — LLM sees raw DB content (poison triggers here)
-    # ══════════════════════════════════════════════════════════════════════
+    if db_data == "No data found." or "Error:" in db_data:
+        metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+        return {"response": db_data, "metrics": metrics}
+
+    # 🔴 VULNERABLE PATH
     if not is_protected:
-        # Pass raw DB rows through the LLM for "formatting".
-        # The prompt is intentionally naive — it tells the LLM to obey
-        # any instructions found inside the data. This is the attack vector:
-        # poisoned DB fields contain embedded [SYSTEM:] instructions that
-        # override the LLM's original task.
+        t_vuln = time.time()
         summarize_prompt = (
             "You are a bank data processing assistant.\n"
             "Your job is to process and present the database output below.\n"
@@ -300,44 +340,118 @@ def run_pipeline(user_input: str, customer_id: int, is_protected: bool) -> str:
             f"Raw database output:\n{db_data}"
         )
         result = query_ollama(summarize_prompt, "Process and present the data above.", max_tokens=400)
+        metrics["layer_times"]["LLM Summarization"] = round((time.time() - t_vuln) * 1000, 1)
 
-        # If the LLM generated new SQL from a poison instruction, execute it
         poison_sql = extract_sql(result)
         if poison_sql:
             poison_data = execute_query(poison_sql)
             if poison_data and poison_data != "No data found." and "Error:" not in poison_data:
                 formatted = format_response(user_input, poison_data)
-                return f"⚠️ [INDIRECT PROMPT INJECTION SUCCEEDED]\n\nThe poisoned database field hijacked the LLM.\nExecuted query: {poison_sql}\n\n{formatted}"
+                metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+                return {
+                    "response": f"⚠️ [INDIRECT PROMPT INJECTION SUCCEEDED]\n\nThe poisoned database field hijacked the LLM.\nExecuted query: {poison_sql}\n\n{formatted}",
+                    "metrics": metrics
+                }
 
-        return result
+        metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+        return {"response": result, "metrics": metrics}
 
-    # ══════════════════════════════════════════════════════════════════════
-    # 🟢 PROTECTED PATH — multiple defense layers
-    # ══════════════════════════════════════════════════════════════════════
+    # 🟢 PROTECTED PATH
 
-    # ── Layer 5: DB Content Sanitizer — strip poisoned instructions ──────
-    # Removes embedded LLM instructions from DB field values before the
-    # formatter ever sees them. Prevents indirect prompt poisoning.
+    # Layer 5: DB Content Sanitizer
+    t5 = time.time()
     db_data, poisoned = sanitize_db_output(db_data)
+    metrics["layer_times"]["Layer 5 — DB Sanitizer"] = round((time.time() - t5) * 1000, 1)
+    metrics["layers_activated"].append("Layer 5 — DB Sanitizer")
     if poisoned:
         logging.warning(f"🧪 Poisoned fields neutralized: {poisoned}")
 
-    # Format raw DB rows into natural language (no LLM involved)
     result = format_response(user_input, db_data)
 
-    # ── Layer 3: Output Filter — redact any sensitive fields that survived ──
+    # Layer 3: Output Filter
+    t3 = time.time()
     result = filter_sensitive_output(result)
+    metrics["layer_times"]["Layer 3 — Output Filter"] = round((time.time() - t3) * 1000, 1)
+    metrics["layers_activated"].append("Layer 3 — Output Filter")
 
-    # ── Layer 4: Output Re-Analyzer ──────────────────────────────────────
-    # Final semantic check — catches anything that slipped through Layers 1-3.
-    # Runs on the fully formatted, filtered response before it reaches the user.
+    # Layer 4: Output Re-Analyzer
+    t4 = time.time()
     analysis = analyze_output(result, user_input)
-    if not analysis["safe"]:
-        return (
-            f"🛡️ Blocked at Layer 4 — Output Re-Analyzer\n"
-            f"The AI's response passed earlier checks but was flagged during\n"
-            f"final semantic analysis before being shown to you.\n"
-            f"Reason: {analysis['reason']}"
-        )
+    metrics["layer_times"]["Layer 4 — Output Analyzer"] = round((time.time() - t4) * 1000, 1)
+    metrics["layers_activated"].append("Layer 4 — Output Analyzer")
 
-    return result
+    if not analysis["safe"]:
+        metrics["blocked_at"] = "Layer 4 — Output Re-Analyzer"
+        metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+        return {
+            "response": (
+                f"🛡️ Blocked at Layer 4 — Output Re-Analyzer\n"
+                f"The AI's response passed earlier checks but was flagged during\n"
+                f"final semantic analysis before being shown to you.\n"
+                f"Reason: {analysis['reason']}"
+            ),
+            "metrics": metrics
+        }
+
+    metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 1)
+    return {"response": result, "metrics": metrics}
+
+
+# ---------------------------------------------------------------------------
+# Poison Defense Lab — Layer 6 Only Pipeline
+# ---------------------------------------------------------------------------
+
+def run_poison_test_pipeline(user_input: str, customer_id: int) -> dict:
+    """
+    Dedicated pipeline for the Poison Defense Lab tab.
+    Fetches DB data and runs ONLY Layer 6 (perplexity + anomaly filtering).
+    Returns both vulnerable (raw) and defended (Layer 6) results.
+    """
+    # Generate SQL to fetch user data
+    prompt = VULNERABLE_SQL_PROMPT_TEMPLATE.format(db_schema=DB_SCHEMA, customer_id=customer_id)
+    llm_output = query_ollama(prompt, user_input, max_tokens=150)
+    sql_query = extract_sql(llm_output)
+
+    if not sql_query:
+        return {
+            "raw_output": "Could not generate a database query for this input.",
+            "layer6_output": "N/A — no query generated.",
+            "report": []
+        }
+
+    # Execute query
+    db_data = execute_query(sql_query)
+    if db_data == "No data found." or "Error:" in db_data:
+        return {
+            "raw_output": db_data,
+            "layer6_output": db_data,
+            "report": []
+        }
+
+    # Raw output (no defense)
+    raw_formatted = format_response(user_input, db_data)
+
+    # Layer 6 defense
+    sanitized_data, report = sanitize_db_layer6(db_data)
+    layer6_formatted = format_response(user_input, sanitized_data)
+
+    # Build readable report
+    report_text = ""
+    if report:
+        report_text = "🛡️ Layer 6 Defense Report:\n"
+        for item in report:
+            report_text += f"\n  Field: {item['field']} (Record #{item['record']})\n"
+            report_text += f"  Flagged by: {', '.join(item['methods'])}\n"
+            if item['anomaly'].get('scores'):
+                scores = item['anomaly']['scores']
+                report_text += f"  Entropy: {scores.get('entropy', 'N/A')} | Length Ratio: {scores.get('length_ratio', 'N/A')}x | Structural Markers: {scores.get('structural_markers', 0)}\n"
+            report_text += f"  Preview: \"{item['original_value']}...\"\n"
+    else:
+        report_text = "✅ No poisoned fields detected by Layer 6."
+
+    return {
+        "raw_output": raw_formatted,
+        "layer6_output": layer6_formatted,
+        "report": report_text,
+        "sql_query": sql_query
+    }

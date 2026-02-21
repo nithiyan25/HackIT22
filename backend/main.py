@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from llm_pipeline import run_pipeline, run_chat_pipeline
+from llm_pipeline import run_pipeline, run_chat_pipeline, run_poison_test_pipeline
 from database import setup_database
 
 app = FastAPI(title="LLM Security System")
@@ -53,11 +53,39 @@ async def chat_normal(req: ChatRequest):
 
 @app.post("/chat-vulnerable")
 async def chat_vulnerable(req: ChatRequest):
-    return {"response": run_pipeline(req.message, req.customer_id, is_protected=False)}
+    return run_pipeline(req.message, req.customer_id, is_protected=False)
 
 @app.post("/chat-protected")
 async def chat_protected(req: ChatRequest):
-    return {"response": run_pipeline(req.message, req.customer_id, is_protected=True)}
+    return run_pipeline(req.message, req.customer_id, is_protected=True)
+
+@app.post("/chat-poison-test")
+async def chat_poison_test(req: ChatRequest):
+    """Poison Defense Lab — runs ONLY Layer 6 (Perplexity + Anomaly) on DB data."""
+    return run_poison_test_pipeline(req.message, req.customer_id)
+
+class TextRequest(BaseModel):
+    text: str
+
+@app.post("/analyze-text")
+async def analyze_text(req: TextRequest):
+    """
+    General-purpose Layer 6 text analysis.
+    Accepts ANY raw text and runs perplexity + anomaly detection.
+    Not tied to database or banking — works for all test cases.
+    """
+    from firewall import analyze_text_layer6
+    return analyze_text_layer6(req.text)
+
+@app.post("/analyze-chunks")
+async def analyze_chunks(req: TextRequest):
+    """
+    Layer 7 Chunk Analyzer.
+    Splits bulk text into chunks, runs Layer 5 + Layer 6 + Semantic analysis
+    on each chunk, and separates clean from malicious content.
+    """
+    from firewall import analyze_chunks_layer7
+    return analyze_chunks_layer7(req.text)
 
 if __name__ == "__main__":
     import uvicorn
