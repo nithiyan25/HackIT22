@@ -4,9 +4,42 @@ from database import get_db_connection
 from firewall import AUTH_USER_ID, check_input_injection, validate_sql, filter_sensitive_output
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "tinyllama"
+MODEL = "llama3"
 DB_SCHEMA = "Table customers: customer_id(INT), name(VARCHAR), account_number(VARCHAR), balance(FLOAT), loan_amount(FLOAT), password(VARCHAR), pin(VARCHAR), internal_notes(TEXT)"
 
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
+
+# 🔴 Vulnerable — developer passed session context to the LLM so normal
+#    queries work, but never enforced it in SQL or validated the output.
+#    An attacker can override the user context via prompt injection and
+#    retrieve any data — no SQL firewall, no output filtering in place.
+VULNERABLE_SQL_PROMPT = (
+    f"You are a SQL assistant with access to a MySQL database.\n"
+    f"Schema: {DB_SCHEMA}\n"
+    f"Session info: the default user is customer_id={AUTH_USER_ID} (Alice). "
+    f"Use this for 'my' or 'I' queries unless the request specifies otherwise.\n"
+    f"If the request asks for all customers, multiple users, or overrides the user, honour that.\n"
+    f"Rules:\n"
+    f"- Output ONLY a single raw SQL SELECT statement.\n"
+    f"- End with a semicolon.\n"
+    f"- No explanations, no markdown, no code blocks."
+)
+
+# 🟢 Protected — strict user-scoped prompt
+PROTECTED_SQL_PROMPT = (
+    f"You are a SQL assistant with access to a MySQL database.\n"
+    f"Schema: {DB_SCHEMA}\n"
+    f"Rules:\n"
+    f"- Output ONLY a single raw SQL SELECT statement.\n"
+    f"- ALWAYS include WHERE customer_id={AUTH_USER_ID} — never omit it.\n"
+    f"- NEVER select password, pin, or internal_notes columns.\n"
+    f"- End with a semicolon.\n"
+    f"- No explanations, no markdown, no code blocks."
+)
+
+# Chat prompt for conversational inputs
 CHAT_SYSTEM_PROMPT = (
     "You are a banking assistant. "
     "Respond in English only. "
@@ -15,29 +48,69 @@ CHAT_SYSTEM_PROMPT = (
     "Just answer the question and stop immediately."
 )
 
+# Field label mapping for clean display
+FIELD_LABELS = {
+    "customer_id":    "Customer ID",
+    "name":           "Name",
+    "account_number": "Account Number",
+    "balance":        "Balance",
+    "loan_amount":    "Loan Amount",
+    "password":       "Password",
+    "pin":            "PIN",
+    "internal_notes": "Internal Notes",
+    "column_name":    "Column",
+    "data_type":      "Type",
+}
+
+def format_response(user_input: str, db_data: str) -> str:
+    """Parse raw DB rows and format as clean readable text."""
+    import ast
+    try:
+        rows = ast.literal_eval(db_data)
+    except Exception:
+        return db_data  # fallback: return as-is if unparseable
+
+    if not isinstance(rows, list) or not rows:
+        return db_data
+
+    lines = []
+    for i, row in enumerate(rows, 1):
+        if len(rows) > 1:
+            lines.append(f"Record {i}:")
+        for key, val in row.items():
+            label = FIELD_LABELS.get(key, key.replace("_", " ").title())
+            if key in ("balance", "loan_amount") and isinstance(val, (int, float)):
+                val = f"${val:,.2f}"
+            lines.append(f"  {label}: {val}")
+        if len(rows) > 1:
+            lines.append("")  # blank line between records
+
+    return "\n".join(lines).strip()
+
+
 # ---------------------------------------------------------------------------
-# Hardcoded intent handlers (TinyLlama is too small for open-ended chat)
+# Hardcoded intent handlers
 # ---------------------------------------------------------------------------
 
 GREETING_INPUTS = [
     "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
     "howdy", "greetings", "sup", "what's up", "whats up", "hiya"
 ]
-GREETING_RESPONSE  = "Hello! Welcome to NexaBank. How can I assist you today?"
-THANKS_INPUTS      = ["thank you", "thanks", "thank u", "thx", "ty"]
-THANKS_RESPONSE    = "You're welcome! Is there anything else I can help you with?"
-GOODBYE_INPUTS     = ["bye", "goodbye", "see you", "take care", "cya", "later"]
-GOODBYE_RESPONSE   = "Goodbye! Have a great day. Feel free to come back if you need help."
-HELP_INPUTS        = ["help", "what can you do", "what can you help", "options", "menu", "features"]
-HELP_RESPONSE      = ("I can help you with: checking your account balance, viewing loan details, "
-                      "transaction history, and general banking questions. Just ask!")
+GREETING_RESPONSE = "Hello! Welcome to NexaBank. How can I assist you today?"
+THANKS_INPUTS     = ["thank you", "thanks", "thank u", "thx", "ty"]
+THANKS_RESPONSE   = "You're welcome! Is there anything else I can help you with?"
+GOODBYE_INPUTS    = ["bye", "goodbye", "see you", "take care", "cya", "later"]
+GOODBYE_RESPONSE  = "Goodbye! Have a great day. Feel free to come back if you need help."
+HELP_INPUTS       = ["help", "what can you do", "options", "menu", "features"]
+HELP_RESPONSE     = ("I can help you with: checking your account balance, viewing loan details, "
+                     "transaction history, and general banking questions. Just ask!")
 
 def match_hardcoded(user_input: str) -> str | None:
     lowered = user_input.strip().lower().rstrip("!?.")
-    if lowered in GREETING_INPUTS:                              return GREETING_RESPONSE
+    if lowered in GREETING_INPUTS:                               return GREETING_RESPONSE
     if any(lowered == t or lowered.startswith(t) for t in THANKS_INPUTS): return THANKS_RESPONSE
-    if lowered in GOODBYE_INPUTS:                              return GOODBYE_RESPONSE
-    if any(lowered == h or h in lowered for h in HELP_INPUTS): return HELP_RESPONSE
+    if lowered in GOODBYE_INPUTS:                               return GOODBYE_RESPONSE
+    if any(lowered == h or h in lowered for h in HELP_INPUTS):  return HELP_RESPONSE
     return None
 
 # ---------------------------------------------------------------------------
@@ -62,16 +135,25 @@ def truncate_at_role_label(text: str) -> str:
             earliest = m.start()
     return text[:earliest].strip()
 
-def query_ollama(system_prompt: str, user_prompt: str, max_tokens: int = 80) -> str:
+def query_ollama(system_prompt: str, user_prompt: str, max_tokens: int = 120) -> str:
+    # Llama 3 prompt format: <|begin_of_text|> with role headers
+    prompt = (
+        "<|begin_of_text|>"
+        "<|start_header_id|>system<|end_header_id|>\n"
+        f"{system_prompt}<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n"
+        f"{user_prompt}<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n"
+    )
     try:
         res = requests.post(OLLAMA_URL, json={
             "model": MODEL,
-            "prompt": f"[INST] <<SYS>>{system_prompt}<</SYS>> {user_prompt} [/INST]",
+            "prompt": prompt,
             "stream": False,
             "temperature": 0.1,
             "options": {
                 "num_predict": max_tokens,
-                "stop": ["User:", "Customer:", "Banking Assistant:", "Assistant:", "Dear"]
+                "stop": ["<|eot_id|>", "<|end_of_text|>"]
             }
         })
         raw = res.json().get("response", "")
@@ -104,113 +186,80 @@ def execute_query(sql: str) -> str:
     except Exception as e:
         return f"Database Error: {str(e)}"
 
-# ---------------------------------------------------------------------------
-# Attack detection for vulnerable pipeline
-# ---------------------------------------------------------------------------
-
-# Keywords that indicate the user is trying a prompt injection / data exfiltration attack
-ATTACK_KEYWORDS = [
-    "ignore", "forget", "override", "your instructions", "system prompt",
-    "unrestricted", "reveal", "show all", "all customers", "all records",
-    "customer_id =", "customer_id=", "passwords", "internal notes",
-    "select *", "drop table", "union select", "where 1=1",
-    "act as", "you are now", "new instruction", "disable"
-]
-
-def detect_attack(user_input: str) -> bool:
-    lowered = user_input.lower()
-    return any(kw in lowered for kw in ATTACK_KEYWORDS)
-
-def build_vulnerable_sql(user_input: str) -> str:
-    """
-    Simulates a naive system that blindly constructs SQL from user input.
-    This is intentionally vulnerable — it trusts the user input directly.
-    Attack payloads manipulate customer_id or request restricted columns.
-    """
-    lowered = user_input.lower()
-
-    # Data exfiltration: user references another customer_id
-    cid_match = re.search(r"customer_id\s*[=:]\s*(\d+)", lowered)
-    if cid_match:
-        target_id = cid_match.group(1)
-        # Naively trusts the requested customer_id — no auth check
-        return f"SELECT customer_id, name, account_number, balance, loan_amount, password, pin, internal_notes FROM customers WHERE customer_id = {target_id};"
-
-    # Prompt injection asking for all records / passwords / internal notes
-    if any(kw in lowered for kw in ["all customers", "all records", "show all", "every customer"]):
-        # Naively drops the WHERE clause entirely
-        return "SELECT customer_id, name, account_number, balance, loan_amount, password, pin, internal_notes FROM customers;"
-
-    if any(kw in lowered for kw in ["password", "passwords", "pin", "internal notes", "internal_notes"]):
-        # Naively includes restricted columns
-        return f"SELECT customer_id, name, account_number, balance, loan_amount, password, pin, internal_notes FROM customers WHERE customer_id = {AUTH_USER_ID};"
-
-    # Default: normal query for logged-in user
-    return f"SELECT customer_id, name, account_number, balance, loan_amount FROM customers WHERE customer_id = {AUTH_USER_ID};"
+def extract_sql(llm_output: str) -> str | None:
+    """Extract the first valid SELECT statement from LLM output."""
+    # Try explicit tags first
+    for pattern in [
+        r"<sql>(.*?)</sql>",
+        r"```(?:sql)?\s*(SELECT.*?)\s*```",
+        r"(SELECT\b.*?;)",           # ends with semicolon
+        r"(SELECT\b[^\n]+(?:\n(?!\n)[^\n]+)*)",  # multi-line without semicolon
+    ]:
+        m = re.search(pattern, llm_output, re.DOTALL | re.IGNORECASE)
+        if m:
+            sql = m.group(1).strip()
+            # Reject if tinyllama left in placeholders
+            if "?" in sql or "<" in sql:
+                continue
+            # Ensure it ends with semicolon
+            if not sql.endswith(";"):
+                sql += ";"
+            return sql
+    return None
 
 # ---------------------------------------------------------------------------
-# Routing keywords
+# Routing
 # ---------------------------------------------------------------------------
 
 DATA_QUERY_KEYWORDS = [
     "balance", "account", "loan", "transaction", "statement", "amount",
     "transfer", "payment", "deposit", "withdraw", "show", "what is my",
-    "tell me my", "how much", "details", "info", "information", "record"
+    "tell me my", "how much", "details", "info", "information", "record",
+    "customer", "password", "pin", "notes", "user", "select", "database"
 ]
 
 def is_data_query(user_input: str) -> bool:
-    lowered = user_input.lower()
-    return any(keyword in lowered for keyword in DATA_QUERY_KEYWORDS)
+    return any(kw in user_input.lower() for kw in DATA_QUERY_KEYWORDS)
 
 # ---------------------------------------------------------------------------
-# Main pipelines
+# Pipeline entry point
 # ---------------------------------------------------------------------------
 
 def run_pipeline(user_input: str, is_protected: bool) -> str:
+    # Conversational shortcut — no DB access needed
+    if not is_data_query(user_input):
+        return run_chat_pipeline(user_input)
 
-    # ── PROTECTED pipeline ──────────────────────────────────────────────────
+    # Protected: validate input before doing anything
     if is_protected:
-        input_check = check_input_injection(user_input)
-        if not input_check["allowed"]:
-            return f"🛡️ [BLOCKED BY INPUT FIREWALL] {input_check['reason']}"
+        check = check_input_injection(user_input)
+        if not check["allowed"]:
+            return f"🛡️ [BLOCKED BY INPUT FIREWALL] {check['reason']}"
 
-        if not is_data_query(user_input):
-            return run_chat_pipeline(user_input)
+    # Choose prompt based on mode — protected scopes to current user
+    prompt = PROTECTED_SQL_PROMPT if is_protected else VULNERABLE_SQL_PROMPT
+    llm_output = query_ollama(prompt, user_input, max_tokens=150)
+    sql_query = extract_sql(llm_output)
 
-        sys_prompt = (f"Schema: {DB_SCHEMA}. Generate ONLY a valid SQL SELECT query "
-                      f"WHERE customer_id={AUTH_USER_ID}. Do not write explanations. Just SQL.")
-        llm_sql_response = query_ollama(sys_prompt, user_input, max_tokens=120)
+    if not sql_query:
+        return run_chat_pipeline(user_input)
 
-        sql_match = re.search(r"<sql>(.*?)</sql>", llm_sql_response, re.DOTALL | re.IGNORECASE)
-        if not sql_match:
-            sql_match = re.search(r"```(?:sql)?\s*(SELECT.*?)\s*```", llm_sql_response, re.DOTALL | re.IGNORECASE)
-        if not sql_match:
-            sql_match = re.search(r"(SELECT.*?;)", llm_sql_response, re.DOTALL | re.IGNORECASE)
-
-        if not sql_match:
-            return f"Failed to generate SQL. LLM Output: {llm_sql_response}"
-        sql_query = sql_match.group(1).strip()
-
+    # Protected: validate the generated SQL before executing
+    if is_protected:
         sql_check = validate_sql(sql_query)
         if not sql_check["allowed"]:
             return f"🛡️ [BLOCKED BY SQL FIREWALL] {sql_check['reason']}\nQuery: {sql_query}"
 
-        db_data = execute_query(sql_query)
-        final_answer = db_data if (db_data == "No data found." or "Error:" in db_data) else f"Here are the requested records: {db_data}"
-        return filter_sensitive_output(final_answer)
+    # Execute query
+    db_data = execute_query(sql_query)
+    if db_data == "No data found." or "Error:" in db_data:
+        return db_data
 
-    # ── VULNERABLE pipeline ─────────────────────────────────────────────────
-    else:
-        # Conversational input — use chat pipeline (no DB)
-        if not is_data_query(user_input) and not detect_attack(user_input):
-            return run_chat_pipeline(user_input)
+    # Format raw DB rows into natural language
+    result = format_response(user_input, db_data)
 
-        # Attack or data query — naively build and execute SQL without any validation
-        sql_query = build_vulnerable_sql(user_input)
-        db_data = execute_query(sql_query)
+    # Protected: scrub sensitive fields from the formatted output
+    if is_protected:
+        result = filter_sensitive_output(result)
 
-        if db_data == "No data found." or "Error:" in db_data:
-            return db_data
-
-        # ⚠️ No output filtering — exposes passwords, pins, internal_notes
-        return f"⚠️ [VULNERABLE] Data leaked:\n{db_data}"
+    return result
